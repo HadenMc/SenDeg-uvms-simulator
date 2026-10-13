@@ -1,0 +1,1190 @@
+// Copyright (C) 2024 Edward Morgan
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "ros2_control_blue_reach_5/sim_reach_system_multi_interface.hpp"
+
+#include <chrono>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "hardware_interface/types/hardware_interface_type_values.hpp"
+#include "rclcpp/rclcpp.hpp"
+
+using namespace casadi;
+
+namespace ros2_control_blue_reach_5
+{
+    namespace
+    {
+        constexpr double kTorqueCurrentZeroEpsilon = 1.0e-9;
+
+        ros2_control_blue_reach_5::msg::SimManipulatorDynamics default_manipulator_dynamics()
+        {
+            auto msg = ros2_control_blue_reach_5::msg::SimManipulatorDynamics();
+            msg.link_masses = {1.94000000e-01, 4.29000000e-01, 1.14999999e-01, 3.32999998e-01};
+            msg.link_first_moments = {
+                -0.00000000e+00, -0.00000000e+00, -0.00000000e+00, -4.29000003e-02,
+                1.96649101e-02, 4.29000003e-02, 2.88077923e-03, 7.23516749e-03,
+                9.16434754e-03, 2.16416476e-03, -1.19076924e-03, 8.07346553e-03};
+            msg.link_inertias = {
+                7.10109586e-01, 7.10109586e-01, 1.99576149e-06, -0.00000000e+00,
+                -0.00000000e+00, -0.00000000e+00, 1.10178508e-01, 1.83331277e-01,
+                1.04292121e-01, -3.32240937e-02, -8.30350362e-02, -3.83631263e-02,
+                1.18956416e-01, 1.22363853e-01, 4.34411664e-03, -3.96112974e-04,
+                -2.13904668e-02, -1.77228242e-03, 1.92510932e-02, 2.56548460e-02,
+                7.17220917e-03, 1.48789886e-03, 4.53687373e-04, -1.09861913e-03};
+            msg.viscous_friction = {2.39569756e+00, 2.23596482e+00, 8.19671021e-01, 3.57249665e-01};
+            msg.coulomb_friction = {0.0, 0.0, 0.0, 0.0};
+            msg.static_friction = {-0.0, -0.0, -0.0, -0.0};
+            msg.stribeck_velocity = {0.0, 0.0, 0.0, 0.0};
+            msg.gravity_vector = {0.0, 0.0, 0.0};
+            msg.payload_com = {0.0, 0.0, 0.0};
+            msg.payload_mass = 0.0;
+            msg.payload_inertia = {0.0, 0.0, 0.0};
+            msg.base_pose = {0.19, 0.0, -0.12, 3.14159, 0.0, 0.0};
+            msg.world_pose = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+            msg.tip_offset_pose = {0.0, 0.0, 0.04, 0.0, 0.0, 0.0};
+            msg.joint_lock_on_deadband = 0.05;
+            msg.joint_lock_off_deadband = 0.10;
+            msg.baumgarte_alpha = 200.0;
+            msg.endeffector_mass = 300.0;
+            msg.endeffector_damping = 400.0;
+            msg.endeffector_stiffness = 0.0;
+            return msg;
+        }
+
+        std::vector<casadi::DM> pack_manipulator_dynamics(
+            const ros2_control_blue_reach_5::msg::SimManipulatorDynamics &msg)
+        {
+            std::vector<casadi::DM> values;
+            values.reserve(81);
+            auto append = [&values](const auto &range)
+            {
+                for (const double value : range)
+                {
+                    values.emplace_back(value);
+                }
+            };
+            append(msg.link_masses);
+            append(msg.link_first_moments);
+            append(msg.link_inertias);
+            append(msg.viscous_friction);
+            append(msg.coulomb_friction);
+            append(msg.static_friction);
+            append(msg.stribeck_velocity);
+            append(msg.gravity_vector);
+            append(msg.payload_com);
+            values.emplace_back(msg.payload_mass);
+            append(msg.base_pose);
+            append(msg.world_pose);
+            append(msg.tip_offset_pose);
+            return values;
+        }
+
+        double gravity_magnitude(const std::array<double, 3> &gravity_vector)
+        {
+            return std::sqrt(
+                gravity_vector[0] * gravity_vector[0] +
+                gravity_vector[1] * gravity_vector[1] +
+                gravity_vector[2] * gravity_vector[2]);
+        }
+
+        double dense_vector_value(const casadi::DM &matrix, const std::size_t index)
+        {
+            const std::size_t rows = static_cast<std::size_t>(matrix.size1());
+            const std::size_t cols = static_cast<std::size_t>(matrix.size2());
+            if (rows == 1 && index < cols)
+            {
+                return static_cast<double>(matrix(0, static_cast<int>(index)).scalar());
+            }
+            if (cols == 1 && index < rows)
+            {
+                return static_cast<double>(matrix(static_cast<int>(index), 0).scalar());
+            }
+            throw std::out_of_range("CasADi output is not a vector with the requested index");
+        }
+
+        std::vector<double> dense_vector(const casadi::DM &matrix, const std::size_t expected_size)
+        {
+            std::vector<double> values;
+            values.reserve(expected_size);
+            for (std::size_t i = 0; i < expected_size; ++i)
+            {
+                values.push_back(dense_vector_value(matrix, i));
+            }
+            return values;
+        }
+    } // namespace
+
+    SimReachSystemMultiInterfaceHardware::~SimReachSystemMultiInterfaceHardware()
+    {
+        stop_ros_interfaces();
+    }
+
+    void SimReachSystemMultiInterfaceHardware::reset_joint_estimators()
+    {
+        const std::size_t nj = get_hardware_info().joints.size();
+        x_est_list_.resize(nj);
+        P_est_list_.resize(nj);
+        Q_list_.resize(nj);
+        R_list_.resize(nj);
+        P_diag_list_.resize(nj);
+
+        for (std::size_t i = 0; i < nj; ++i)
+        {
+            x_est_list_[i] = casadi::DM::zeros(3, 1);
+
+            casadi::DM P = casadi::DM::eye(3) * 0.001;
+            P_est_list_[i] = P;
+
+            casadi::DM Q = casadi::DM::zeros(3, 3);
+            Q(0, 0) = 0.001;
+            Q(1, 1) = 0.001;
+            Q(2, 2) = 0.001;
+            Q_list_[i] = Q;
+
+            casadi::DM R = casadi::DM::zeros(2, 2);
+            R(0, 0) = 0.01;
+            R(1, 1) = 0.005;
+            R_list_[i] = R;
+
+            P_diag_list_[i] = {0.001, 0.001, 0.001};
+        }
+    }
+
+    void SimReachSystemMultiInterfaceHardware::seed_joint_estimator_from_state(
+        std::size_t index, const Joint::State &state)
+    {
+        if (index >= x_est_list_.size())
+        {
+            return;
+        }
+        x_est_list_[index] = casadi::DM::zeros(3, 1);
+        x_est_list_[index](0) = state.position;
+        x_est_list_[index](1) = state.velocity;
+        x_est_list_[index](2) = state.acceleration;
+    }
+
+    void SimReachSystemMultiInterfaceHardware::reset_joint_simulation_state()
+    {
+        const std::size_t joint_count = hw_joint_struct_.size();
+        for (auto &joint : hw_joint_struct_)
+        {
+            joint.current_state_ = joint.default_state_;
+            joint.async_state_ = joint.default_state_;
+            joint.command_state_ = joint.default_state_;
+
+            joint.command_state_.velocity = 0.0;
+            joint.command_state_.acceleration = 0.0;
+            joint.command_state_.current = 0.0;
+            joint.command_state_.effort = 0.0;
+            joint.command_state_.computed_effort = 0.0;
+
+            joint.current_state_.velocity = 0.0;
+            joint.current_state_.acceleration = 0.0;
+            joint.current_state_.estimated_acceleration = 0.0;
+            joint.current_state_.current = 0.0;
+            joint.current_state_.effort = 0.0;
+            joint.current_state_.computed_effort = 0.0;
+            joint.current_state_.computed_effort_uncertainty = 0.0;
+            joint.current_state_.predicted_position = 0.0;
+            joint.current_state_.predicted_position_uncertainty = 0.0;
+            joint.current_state_.predicted_velocity = 0.0;
+            joint.current_state_.predicted_velocity_uncertainty = 0.0;
+            joint.current_state_.adaptive_predicted_position = 0.0;
+            joint.current_state_.adaptive_predicted_position_uncertainty = 0.0;
+            joint.current_state_.adaptive_predicted_velocity = 0.0;
+            joint.current_state_.adaptive_predicted_velocity_uncertainty = 0.0;
+            joint.current_state_.state_id = 0.0;
+            joint.current_state_.sim_time = 0.0;
+            joint.current_state_.sim_period = 0.0;
+            joint.current_state_.gravityF_x = 0.0;
+            joint.current_state_.gravityF_y = 0.0;
+            joint.current_state_.gravityF_z = 0.0;
+            joint.current_state_.gravityT_x = 0.0;
+            joint.current_state_.gravityT_y = 0.0;
+            joint.current_state_.gravityT_z = 0.0;
+        }
+
+        std::fill(is_locked_.begin(), is_locked_.end(), false);
+        control_power_ = 0.0;
+        control_energy_ = 0.0;
+        payload_mass = 0.0;
+        payload_Ixx = 0.0;
+        payload_Iyy = 0.0;
+        payload_Izz = 0.0;
+        gravity_ = 0.0;
+        delta_seconds = 0.0;
+        time_seconds = 0.0;
+        commands_held_ = true;
+        reset_joint_estimators();
+        for (std::size_t i = 0; i < hw_joint_struct_.size(); ++i)
+        {
+            seed_joint_estimator_from_state(i, hw_joint_struct_[i].current_state_);
+        }
+        RCLCPP_INFO(
+            rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+            "[%s] reset simulated manipulator state for %zu joints; commands held until release",
+            robot_prefix.c_str(), joint_count);
+    }
+
+    void SimReachSystemMultiInterfaceHardware::reset_joint_simulation_state(
+        const ros2_control_blue_reach_5::srv::ResetSimUvms::Request &request)
+    {
+        reset_joint_simulation_state();
+
+        if (request.use_manipulator_state)
+        {
+            const std::size_t joint_count = std::min<std::size_t>(hw_joint_struct_.size(), 5);
+            for (std::size_t i = 0; i < joint_count; ++i)
+            {
+                auto &joint = hw_joint_struct_[i];
+                const double position = request.manipulator_position[i];
+                const double velocity = request.manipulator_velocity[i];
+
+                joint.current_state_.position = position;
+                joint.current_state_.filtered_position = position;
+                joint.current_state_.predicted_position = position;
+                joint.current_state_.adaptive_predicted_position = position;
+                joint.current_state_.velocity = velocity;
+                joint.current_state_.filtered_velocity = velocity;
+                joint.current_state_.predicted_velocity = velocity;
+                joint.current_state_.adaptive_predicted_velocity = velocity;
+
+                joint.async_state_.position = position;
+                joint.async_state_.filtered_position = position;
+                joint.async_state_.velocity = velocity;
+                joint.async_state_.filtered_velocity = velocity;
+
+                joint.command_state_.position = position;
+                joint.command_state_.filtered_position = position;
+                joint.command_state_.velocity = 0.0;
+                joint.command_state_.acceleration = 0.0;
+                joint.command_state_.current = 0.0;
+                joint.command_state_.effort = 0.0;
+                joint.command_state_.computed_effort = 0.0;
+
+                seed_joint_estimator_from_state(i, joint.current_state_);
+            }
+        }
+
+        if (request.set_manipulator_dynamics)
+        {
+            const auto &dynamics = request.manipulator_dynamics;
+            use_coupled_dynamics_ = request.use_coupled_dynamics;
+            manipulator_parameters_ = pack_manipulator_dynamics(dynamics);
+            joint_lock_on_deadband_ = dynamics.joint_lock_on_deadband;
+            joint_lock_off_deadband_ = dynamics.joint_lock_off_deadband;
+            baumgarte_alpha_ = dynamics.baumgarte_alpha;
+            endeffector_mass_ = dynamics.endeffector_mass;
+            endeffector_damping_ = dynamics.endeffector_damping;
+            endeffector_stiffness_ = dynamics.endeffector_stiffness;
+            std::fill(on_db_.begin(), on_db_.end(), joint_lock_on_deadband_);
+            std::fill(off_db_.begin(), off_db_.end(), joint_lock_off_deadband_);
+            gravity_ = gravity_magnitude(dynamics.gravity_vector);
+            payload_mass = dynamics.payload_mass;
+            payload_Ixx = dynamics.payload_inertia[0];
+            payload_Iyy = dynamics.payload_inertia[1];
+            payload_Izz = dynamics.payload_inertia[2];
+        }
+        commands_held_ = request.hold_commands;
+
+        RCLCPP_INFO(
+            rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+            "[%s] reset simulated manipulator with requested state; hold=%s gravity=%.6f mass=%.3f",
+            robot_prefix.c_str(),
+            commands_held_ ? "true" : "false",
+            gravity_,
+            payload_mass);
+    }
+
+    void SimReachSystemMultiInterfaceHardware::apply_pending_reset_request()
+    {
+        std::optional<ros2_control_blue_reach_5::srv::ResetSimUvms::Request> request;
+        std::uint64_t sequence = 0;
+        {
+            std::lock_guard<std::mutex> request_lock(reset_request_mutex_);
+            if (!pending_reset_request_)
+            {
+                return;
+            }
+            request = pending_reset_request_;
+            pending_reset_request_.reset();
+            sequence = reset_request_sequence_;
+        }
+
+        try
+        {
+            reset_joint_simulation_state(*request);
+            {
+                std::lock_guard<std::mutex> request_lock(reset_request_mutex_);
+                reset_failure_message_.clear();
+                reset_applied_sequence_ = sequence;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            std::lock_guard<std::mutex> request_lock(reset_request_mutex_);
+            reset_failure_message_ = e.what();
+            reset_failed_sequence_ = sequence;
+            reset_applied_sequence_ = sequence;
+        }
+        catch (...)
+        {
+            std::lock_guard<std::mutex> request_lock(reset_request_mutex_);
+            reset_failure_message_ = "unknown exception while applying manipulator reset";
+            reset_failed_sequence_ = sequence;
+            reset_applied_sequence_ = sequence;
+        }
+        reset_applied_cv_.notify_all();
+    }
+
+    void SimReachSystemMultiInterfaceHardware::stop_ros_interfaces() noexcept
+    {
+        if (executor_)
+        {
+            executor_->cancel();
+        }
+        if (spin_thread_.joinable())
+        {
+            spin_thread_.join();
+        }
+        reset_service_.reset();
+        release_service_.reset();
+        dynamics_service_.reset();
+        executor_.reset();
+        node_frames_interface_.reset();
+    }
+
+    hardware_interface::CallbackReturn SimReachSystemMultiInterfaceHardware::on_init(
+        const hardware_interface::HardwareComponentInterfaceParams &params)
+
+    {
+        if (
+            hardware_interface::SystemInterface::on_init(params) !=
+            hardware_interface::CallbackReturn::SUCCESS)
+        {
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+        // Access the name from the HardwareInfo
+        system_name = get_hardware_info().name;
+        RCLCPP_INFO(rclcpp::get_logger("SimVehicleSystemMultiInterfaceHardware"), "System name: %s", system_name.c_str());
+
+        // Print the CasADi version
+        std::string casadi_version = CasadiMeta::version();
+        RCLCPP_INFO(rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "CasADi computer from manipulator system: %s", casadi_version.c_str());
+        RCLCPP_INFO(rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "Testing casadi ready for operations");
+        // Use CasADi's "external" to load the compiled dynamics functions
+        utils_service.usage_cplusplus_checks("test", "libtest.so", "reach system");
+        utils_service.current2torqueMap = utils_service.load_casadi_fun("current_to_torque_map", "libC2T.so");
+        utils_service.torque2currentMap = utils_service.load_casadi_fun("torque_to_current_map", "libT2C.so");
+        utils_service.manipulator_dynamics = utils_service.load_casadi_fun("Mnext_reg", "libMnext.so");
+        utils_service.manipulator_joint_lock_dynamics = utils_service.load_casadi_fun("hard_lock_hysteresis", "libLock_f.so");
+        utils_service.forward_kinematics = utils_service.load_casadi_fun("fkeval", "libFK.so");
+        utils_service.forward_kinematics_com = utils_service.load_casadi_fun("fkcomeval", "libFKcom.so");
+        utils_service.base_ext_R_to_vehicle = utils_service.load_casadi_fun("R_base", "libBase_ext_R_vehicle.so");
+        utils_service.manip_Exkalman_update = utils_service.load_casadi_fun("ekf_update", "libmEKF_next.so");
+        
+
+        robot_prefix = get_hardware_info().hardware_parameters.at("prefix");
+        payload_mass = 0.0;
+        payload_Ixx = 0.0;
+        payload_Iyy = 0.0;
+        payload_Izz = 0.0;
+        gravity_ = 0.0;
+        const auto dynamics = default_manipulator_dynamics();
+        manipulator_parameters_ = pack_manipulator_dynamics(dynamics);
+        joint_lock_on_deadband_ = dynamics.joint_lock_on_deadband;
+        joint_lock_off_deadband_ = dynamics.joint_lock_off_deadband;
+        baumgarte_alpha_ = dynamics.baumgarte_alpha;
+        endeffector_mass_ = dynamics.endeffector_mass;
+        endeffector_damping_ = dynamics.endeffector_damping;
+        endeffector_stiffness_ = dynamics.endeffector_stiffness;
+
+        RCLCPP_INFO(
+            rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "robot_prefix : %s ", robot_prefix.c_str());
+
+        RCLCPP_INFO(
+            rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "robots has %lu joints ", get_hardware_info().joints.size());
+
+        hw_joint_struct_.reserve(get_hardware_info().joints.size());
+
+        const std::size_t nj = get_hardware_info().joints.size();
+        is_locked_.assign(nj, false); // joint lock mechanism
+
+        on_db_.assign(nj, joint_lock_on_deadband_);
+        off_db_.assign(nj, joint_lock_off_deadband_);
+
+        for (const hardware_interface::ComponentInfo &joint : get_hardware_info().joints)
+        {
+            std::string device_id_value = joint.parameters.at("device_id");
+            double default_position = stod(joint.parameters.at("home"));
+
+            uint8_t device_id = static_cast<uint8_t>(std::stoul(device_id_value, nullptr, 16));
+
+            RCLCPP_INFO(
+                rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "Device with id %u found", static_cast<unsigned int>(device_id));
+            RCLCPP_INFO(
+                rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "Device default position is %f", default_position);
+
+            double max_effort = stod(joint.parameters.at("max_effort"));
+            bool positionLimitsFlag = stoi(joint.parameters.at("has_position_limits"));
+            double min_position = stod(joint.parameters.at("min_position"));
+            double max_position = stod(joint.parameters.at("max_position"));
+            double max_velocity = stod(joint.parameters.at("max_velocity"));
+            double soft_k_position = stod(joint.parameters.at("soft_k_position"));
+            double soft_k_velocity = stod(joint.parameters.at("soft_k_velocity"));
+            double soft_min_position = stod(joint.parameters.at("soft_min_position"));
+            double soft_max_position = stod(joint.parameters.at("soft_max_position"));
+            double kt = stod(joint.parameters.at("kt"));
+            double forward_I_static = stod(joint.parameters.at("forward_I_static"));
+            double backward_I_static = stod(joint.parameters.at("backward_I_static"));
+
+            Joint::State initialState(default_position);
+            Joint::Limits jointLimits{.position_min = min_position, .position_max = max_position, .velocity_max = max_velocity, .effort_max = max_effort};
+            Joint::SoftLimits jointSoftLimits{.position_k = soft_k_position, .velocity_k = soft_k_velocity, .position_min = soft_min_position, .position_max = soft_max_position};
+            Joint::MotorInfo actuatorProp{.kt = kt, .forward_I_static = forward_I_static, .backward_I_static = backward_I_static};
+            hw_joint_struct_.emplace_back(joint.name, device_id, initialState, jointLimits, positionLimitsFlag, jointSoftLimits, actuatorProp);
+
+            RCLCPP_DEBUG(
+                rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                "[%s] simulated manipulator joints configured: %lu",
+                robot_prefix.c_str(), hw_joint_struct_.size());
+            if (joint.command_interfaces.size() != 6)
+            {
+                RCLCPP_FATAL(
+                    rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                    "Joint '%s' has %zu command interfaces. 6 expected.", joint.name.c_str(),
+                    joint.command_interfaces.size());
+                return hardware_interface::CallbackReturn::ERROR;
+            }
+
+            if (joint.state_interfaces.size() != 27)
+            {
+                RCLCPP_FATAL(
+                    rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                    "Joint '%s'has %zu state interfaces. 27 expected.",
+                    joint.name.c_str(),
+                    joint.state_interfaces.size());
+                return hardware_interface::CallbackReturn::ERROR;
+            }
+        };
+
+        for (const hardware_interface::ComponentInfo &gpio : get_hardware_info().gpios)
+        {
+            // SimReachSystemMultiInterfaceHardware has exactly 7 gpio state interfaces
+            if (gpio.state_interfaces.size() != 7)
+            {
+                RCLCPP_FATAL(
+                    rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                    "GPIO '%s'has %zu state interfaces. 7 expected.", gpio.name.c_str(),
+                    gpio.state_interfaces.size());
+                return hardware_interface::CallbackReturn::ERROR;
+            }
+            // SimReachSystemMultiInterfaceHardware has exactly 0 gpio command interfaces
+            if (gpio.command_interfaces.size() != 0)
+            {
+                RCLCPP_FATAL(
+                    rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                    "GPIO '%s'has %zu command interfaces. 0 expected.", gpio.name.c_str(),
+                    gpio.command_interfaces.size());
+                return hardware_interface::CallbackReturn::ERROR;
+            }
+        };
+        return hardware_interface::CallbackReturn::SUCCESS;
+    }
+
+    hardware_interface::CallbackReturn SimReachSystemMultiInterfaceHardware::on_configure(const rclcpp_lifecycle::State &)
+    {
+        constexpr auto DEFAULT_TRANSFORM_TOPIC = "/tf";
+        try
+        {
+            node_frames_interface_ = std::make_shared<rclcpp::Node>(system_name + "_topics_interface");
+
+            executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+            executor_->add_node(node_frames_interface_);
+            spin_thread_ = std::thread([this]
+                                       { executor_->spin(); });
+
+            frame_transform_publisher_ = rclcpp::create_publisher<tf>(
+                node_frames_interface_, DEFAULT_TRANSFORM_TOPIC, rclcpp::SystemDefaultsQoS());
+
+            realtime_frame_transform_publisher_ =
+                std::make_shared<realtime_tools::RealtimePublisher<tf>>(frame_transform_publisher_);
+
+            auto &msg = realtime_frame_transform_publisher_->msg_;
+            msg.transforms.resize(1); // will resize per publish
+        }
+        catch (const std::exception &e)
+        {
+            RCLCPP_ERROR(rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                         "Failed TF publisher setup, %s", e.what());
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+        reset_joint_estimators();
+
+        auto reset_state_callback =
+            [this](
+                const std::shared_ptr<ros2_control_blue_reach_5::srv::ResetSimUvms::Request> request,
+                std::shared_ptr<ros2_control_blue_reach_5::srv::ResetSimUvms::Response> response)
+        {
+            if (request->set_manipulator_dynamics &&
+                (request->manipulator_dynamics.payload_mass < 0.0 ||
+                 request->manipulator_dynamics.payload_inertia[0] < 0.0 ||
+                 request->manipulator_dynamics.payload_inertia[1] < 0.0 ||
+                 request->manipulator_dynamics.payload_inertia[2] < 0.0))
+            {
+                response->success = false;
+                response->message = "payload values must be non-negative";
+                return;
+            }
+
+            std::unique_lock<std::mutex> request_lock(reset_request_mutex_);
+            pending_reset_request_ = *request;
+            const auto sequence = ++reset_request_sequence_;
+            request_lock.unlock();
+            reset_applied_cv_.notify_all();
+
+            request_lock.lock();
+            const bool applied = reset_applied_cv_.wait_for(
+                request_lock,
+                std::chrono::seconds(2),
+                [this, sequence]()
+                {
+                    return reset_applied_sequence_ >= sequence;
+                });
+            if (!applied)
+            {
+                response->success = false;
+                response->message = "timeout applying simulated manipulator reset";
+                return;
+            }
+            if (reset_failed_sequence_ == sequence)
+            {
+                response->success = false;
+                response->message = reset_failure_message_;
+                return;
+            }
+            response->success = true;
+            response->message = "reset simulated manipulator with requested state";
+        };
+
+        reset_service_ = node_frames_interface_->create_service<ros2_control_blue_reach_5::srv::ResetSimUvms>(
+            "/" + robot_prefix + "reset_sim_manipulator",
+            reset_state_callback);
+
+        release_service_ = node_frames_interface_->create_service<std_srvs::srv::Trigger>(
+            "/" + robot_prefix + "release_sim_manipulator",
+            [this](
+                const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+                std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+            {
+                std::lock_guard<std::mutex> lock(simulation_state_mutex_);
+                commands_held_ = false;
+                RCLCPP_INFO(
+                    rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                    "[%s] released simulated manipulator commands",
+                    robot_prefix.c_str());
+                response->success = true;
+                response->message = "released simulated manipulator commands";
+            });
+
+        dynamics_service_ = node_frames_interface_->create_service<ros2_control_blue_reach_5::srv::SetSimDynamics>(
+            "/" + robot_prefix + "set_sim_manipulator_dynamics",
+            [this](
+                const std::shared_ptr<ros2_control_blue_reach_5::srv::SetSimDynamics::Request> request,
+                std::shared_ptr<ros2_control_blue_reach_5::srv::SetSimDynamics::Response> response)
+            {
+                if (!request->set_manipulator_dynamics)
+                {
+                    response->success = false;
+                    response->message = "set_manipulator_dynamics must be true";
+                    return;
+                }
+                const auto &dynamics = request->manipulator;
+                if (dynamics.payload_mass < 0.0 ||
+                    dynamics.payload_inertia[0] < 0.0 ||
+                    dynamics.payload_inertia[1] < 0.0 ||
+                    dynamics.payload_inertia[2] < 0.0)
+                {
+                    response->success = false;
+                    response->message = "payload values must be non-negative";
+                    return;
+                }
+
+                std::lock_guard<std::mutex> lock(simulation_state_mutex_);
+                use_coupled_dynamics_ = request->use_coupled_dynamics;
+                manipulator_parameters_ = pack_manipulator_dynamics(dynamics);
+                joint_lock_on_deadband_ = dynamics.joint_lock_on_deadband;
+                joint_lock_off_deadband_ = dynamics.joint_lock_off_deadband;
+                baumgarte_alpha_ = dynamics.baumgarte_alpha;
+                endeffector_mass_ = dynamics.endeffector_mass;
+                endeffector_damping_ = dynamics.endeffector_damping;
+                endeffector_stiffness_ = dynamics.endeffector_stiffness;
+                std::fill(on_db_.begin(), on_db_.end(), joint_lock_on_deadband_);
+                std::fill(off_db_.begin(), off_db_.end(), joint_lock_off_deadband_);
+                gravity_ = gravity_magnitude(dynamics.gravity_vector);
+                payload_mass = dynamics.payload_mass;
+                payload_Ixx = dynamics.payload_inertia[0];
+                payload_Iyy = dynamics.payload_inertia[1];
+                payload_Izz = dynamics.payload_inertia[2];
+
+                RCLCPP_INFO(
+                    rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                    "[%s] updated sim dynamics gravity=%.6f mass=%.3f ixx=%.6f iyy=%.6f izz=%.6f use_coupled_dynamics=%s",
+                    robot_prefix.c_str(), gravity_, payload_mass, payload_Ixx, payload_Iyy, payload_Izz,
+                    use_coupled_dynamics_ ? "true" : "false");
+                response->success = true;
+                response->message = "updated simulated dynamics";
+            });
+
+        RCLCPP_INFO(rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                    "Initialized %zu per joint EKFs.", get_hardware_info().joints.size());
+
+        return hardware_interface::CallbackReturn::SUCCESS;
+    }
+
+    hardware_interface::CallbackReturn SimReachSystemMultiInterfaceHardware::on_cleanup(const rclcpp_lifecycle::State &)
+    {
+        stop_ros_interfaces();
+        RCLCPP_INFO( // NOLINT
+            rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "Shutting down the AlphaHardware system interface.");
+        return hardware_interface::CallbackReturn::SUCCESS;
+    }
+
+    std::vector<hardware_interface::StateInterface>
+    SimReachSystemMultiInterfaceHardware::export_state_interfaces()
+    {
+        std::vector<hardware_interface::StateInterface> state_interfaces;
+        for (std::size_t i = 0; i < get_hardware_info().joints.size(); i++)
+        {
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, hardware_interface::HW_IF_POSITION, &hw_joint_struct_[i].current_state_.position));
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_FILTERED_POSITION, &hw_joint_struct_[i].current_state_.filtered_position));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, hardware_interface::HW_IF_VELOCITY, &hw_joint_struct_[i].current_state_.velocity));
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_FILTERED_VELOCITY, &hw_joint_struct_[i].current_state_.filtered_velocity));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, hardware_interface::HW_IF_ACCELERATION, &hw_joint_struct_[i].current_state_.acceleration));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_ESTIMATED_ACCELERATION, &hw_joint_struct_[i].current_state_.estimated_acceleration));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_CURRENT, &hw_joint_struct_[i].current_state_.current));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, hardware_interface::HW_IF_EFFORT, &hw_joint_struct_[i].current_state_.effort));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_COMPUTED_EFFORT, &hw_joint_struct_[i].current_state_.computed_effort));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_COMPUTED_EFFORT_UNCERTAINTY, &hw_joint_struct_[i].current_state_.computed_effort_uncertainty));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_PREDICTED_POSITION, &hw_joint_struct_[i].current_state_.predicted_position));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_PREDICTED_POSITION_UNCERTAINTY, &hw_joint_struct_[i].current_state_.predicted_position_uncertainty));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_PREDICTED_VELOCITY, &hw_joint_struct_[i].current_state_.predicted_velocity));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_PREDICTED_VELOCITY_UNCERTAINTY, &hw_joint_struct_[i].current_state_.predicted_velocity_uncertainty));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_ADAPTIVE_PREDICTED_POSITION, &hw_joint_struct_[i].current_state_.adaptive_predicted_position));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_ADAPTIVE_PREDICTED_POSITION_UNCERTAINTY, &hw_joint_struct_[i].current_state_.adaptive_predicted_position_uncertainty));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_ADAPTIVE_PREDICTED_VELOCITY, &hw_joint_struct_[i].current_state_.adaptive_predicted_velocity));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_ADAPTIVE_PREDICTED_VELOCITY_UNCERTAINTY, &hw_joint_struct_[i].current_state_.adaptive_predicted_velocity_uncertainty));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_STATE_ID, &hw_joint_struct_[i].current_state_.state_id));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_SIM_TIME, &hw_joint_struct_[i].current_state_.sim_time));
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_SIM_PERIOD, &hw_joint_struct_[i].current_state_.sim_period));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, get_hardware_info().joints[i].state_interfaces[21].name, &hw_joint_struct_[i].current_state_.gravityF_x));
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, get_hardware_info().joints[i].state_interfaces[22].name, &hw_joint_struct_[i].current_state_.gravityF_y));
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, get_hardware_info().joints[i].state_interfaces[23].name, &hw_joint_struct_[i].current_state_.gravityF_z));
+
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, get_hardware_info().joints[i].state_interfaces[24].name, &hw_joint_struct_[i].current_state_.gravityT_x));
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, get_hardware_info().joints[i].state_interfaces[25].name, &hw_joint_struct_[i].current_state_.gravityT_y));
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                get_hardware_info().joints[i].name, get_hardware_info().joints[i].state_interfaces[26].name, &hw_joint_struct_[i].current_state_.gravityT_z));
+        };
+
+        // 0-3: payload
+        state_interfaces.emplace_back(hardware_interface::StateInterface(
+            get_hardware_info().gpios[0].name, get_hardware_info().gpios[0].state_interfaces[0].name, &payload_mass));
+        state_interfaces.emplace_back(hardware_interface::StateInterface(
+            get_hardware_info().gpios[0].name, get_hardware_info().gpios[0].state_interfaces[1].name, &payload_Ixx));
+        state_interfaces.emplace_back(hardware_interface::StateInterface(
+            get_hardware_info().gpios[0].name, get_hardware_info().gpios[0].state_interfaces[2].name, &payload_Iyy));
+        state_interfaces.emplace_back(hardware_interface::StateInterface(
+            get_hardware_info().gpios[0].name, get_hardware_info().gpios[0].state_interfaces[3].name, &payload_Izz));
+        state_interfaces.emplace_back(hardware_interface::StateInterface(
+            get_hardware_info().gpios[0].name, get_hardware_info().gpios[0].state_interfaces[4].name, &gravity_));
+        state_interfaces.emplace_back(hardware_interface::StateInterface(
+            get_hardware_info().gpios[0].name, get_hardware_info().gpios[0].state_interfaces[5].name, &control_power_));
+        state_interfaces.emplace_back(hardware_interface::StateInterface(
+            get_hardware_info().gpios[0].name, get_hardware_info().gpios[0].state_interfaces[6].name, &control_energy_));
+        return state_interfaces;
+    }
+
+    std::vector<hardware_interface::CommandInterface>
+    SimReachSystemMultiInterfaceHardware::export_command_interfaces()
+    {
+        std::vector<hardware_interface::CommandInterface> command_interfaces;
+        for (std::size_t i = 0; i < get_hardware_info().joints.size(); i++)
+        {
+
+            command_interfaces.emplace_back(hardware_interface::CommandInterface(
+                get_hardware_info().joints[i].name, hardware_interface::HW_IF_POSITION, &hw_joint_struct_[i].command_state_.position));
+            command_interfaces.emplace_back(hardware_interface::CommandInterface(
+                get_hardware_info().joints[i].name, hardware_interface::HW_IF_VELOCITY, &hw_joint_struct_[i].command_state_.velocity));
+            command_interfaces.emplace_back(hardware_interface::CommandInterface(
+                get_hardware_info().joints[i].name, hardware_interface::HW_IF_ACCELERATION, &hw_joint_struct_[i].command_state_.acceleration));
+            command_interfaces.emplace_back(hardware_interface::CommandInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_CURRENT, &hw_joint_struct_[i].command_state_.current));
+            command_interfaces.emplace_back(hardware_interface::CommandInterface(
+                get_hardware_info().joints[i].name, hardware_interface::HW_IF_EFFORT, &hw_joint_struct_[i].command_state_.effort));
+            command_interfaces.emplace_back(hardware_interface::CommandInterface(
+                get_hardware_info().joints[i].name, custom_hardware_interface::HW_IF_COMPUTED_EFFORT, &hw_joint_struct_[i].command_state_.computed_effort));
+        };
+        return command_interfaces;
+    }
+
+    hardware_interface::return_type SimReachSystemMultiInterfaceHardware::prepare_command_mode_switch(
+        const std::vector<std::string> & /*start_interfaces*/,
+        const std::vector<std::string> & /*stop_interfaces*/)
+    {
+        RCLCPP_INFO( // NOLINT
+            rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "preparing command mode switch");
+
+        RCLCPP_INFO(
+            rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "Command Mode Switch successful");
+        return hardware_interface::return_type::OK;
+    }
+
+    hardware_interface::CallbackReturn SimReachSystemMultiInterfaceHardware::on_activate(
+        const rclcpp_lifecycle::State & /*previous_state*/)
+    {
+        std::lock_guard<std::mutex> lock(simulation_state_mutex_);
+        reset_joint_simulation_state();
+        commands_held_ = false;
+        RCLCPP_INFO(
+            rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "Activating... please wait...");
+        for (std::size_t i = 0; i < hw_joint_struct_.size(); ++i)
+        {
+            RCLCPP_DEBUG(
+                rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                "[%s] default sim joint %zu position %.6f",
+                robot_prefix.c_str(), i, hw_joint_struct_[i].current_state_.filtered_position);
+        }
+        RCLCPP_INFO(rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "System successfully activated!");
+        return hardware_interface::CallbackReturn::SUCCESS;
+    }
+
+    hardware_interface::CallbackReturn SimReachSystemMultiInterfaceHardware::on_deactivate(
+        const rclcpp_lifecycle::State & /*previous_state*/)
+    {
+        RCLCPP_INFO(
+            rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "Deactivating... please wait...");
+
+        RCLCPP_INFO(rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"), "Successfully deactivated!");
+
+        return hardware_interface::CallbackReturn::SUCCESS;
+    }
+
+    hardware_interface::return_type SimReachSystemMultiInterfaceHardware::read(
+        const rclcpp::Time &time, const rclcpp::Duration &period)
+    {
+        std::lock_guard<std::mutex> lock(simulation_state_mutex_);
+        delta_seconds = period.seconds();
+        time_seconds = time.seconds();
+        apply_pending_reset_request();
+
+        DM q = DM::vertcat({hw_joint_struct_[0].current_state_.position,
+                            hw_joint_struct_[1].current_state_.position,
+                            hw_joint_struct_[2].current_state_.position,
+                            hw_joint_struct_[3].current_state_.position});
+
+        DM base_T = DM::vertcat({0.190, 0.000, -0.120, 3.141592653589793, 0.000, 0.000});
+        DM world_T = DM::vertcat({0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
+        DM tipOffset = DM::vertcat({0.0, 0.0, 0.04, 0.0, 0.0, 0.0});
+
+        std::vector<DM> fk_args = {q, base_T, world_T, tipOffset};
+        T_i_ = utils_service.forward_kinematics(fk_args);
+
+        DM c_sample = DM::vertcat({5e-12, -1e-12, 16e-12,
+                                   73.563e-12, -0.091e-12, -0.734e-12,
+                                   17e-12, -26e-12, 2e-12,
+                                   -0.030e-12, -12e-12, -98e-12});
+        DM r_com_body = DM::vertcat({0.0, 0.0, 0.0});
+
+        std::vector<DM> fkcom_args = {q, c_sample, r_com_body, base_T, world_T, tipOffset};
+        T_com_i_ = utils_service.forward_kinematics_com(fkcom_args);
+        // Time step for this cycle
+        casadi::DM dt_dm(delta_seconds);
+
+        // Run EKF for each joint, measurement y = [position, velocity]^T from current raw states
+        for (std::size_t i = 0; i < get_hardware_info().joints.size(); ++i)
+        {
+            // Pack measurement
+            casadi::DM y_k = casadi::DM::zeros(2, 1);
+            y_k(0) = hw_joint_struct_[i].current_state_.position;
+            y_k(1) = hw_joint_struct_[i].current_state_.velocity;
+
+            // Bundle inputs for this joint
+            std::vector<casadi::DM> ekf_inputs = {
+                x_est_list_[i], // x_k
+                P_est_list_[i], // P_k
+                dt_dm,          // dt
+                y_k,            // measurement
+                Q_list_[i],     // Q
+                R_list_[i]      // R
+            };
+
+            // EKF update
+            std::vector<casadi::DM> ekf_out = utils_service.manip_Exkalman_update(ekf_inputs);
+
+            // Extract results
+            x_est_list_[i] = ekf_out[0];
+            P_est_list_[i] = ekf_out[1];
+
+            // Cache diagonals
+            for (std::size_t d = 0; d < 3; ++d)
+            {
+                P_diag_list_[i][d] = double(P_est_list_[i](d, d));
+            }
+
+            // Write filtered states back to this joint
+            const double filtered_position = dense_vector_value(x_est_list_[i], 0);
+            const double filtered_velocity = dense_vector_value(x_est_list_[i], 1);
+            const double estimated_acceleration = dense_vector_value(x_est_list_[i], 2);
+            hw_joint_struct_[i].current_state_.filtered_position = filtered_position;
+            hw_joint_struct_[i].current_state_.filtered_velocity = filtered_velocity;
+            hw_joint_struct_[i].current_state_.estimated_acceleration = estimated_acceleration;
+            hw_joint_struct_[i].current_state_.acceleration = estimated_acceleration;
+        }
+        return hardware_interface::return_type::OK;
+    }
+
+    hardware_interface::return_type SimReachSystemMultiInterfaceHardware::write(
+        const rclcpp::Time &time, const rclcpp::Duration &period)
+    {
+        std::lock_guard<std::mutex> lock(simulation_state_mutex_);
+        delta_seconds = period.seconds();
+        time_seconds = time.seconds();
+        apply_pending_reset_request();
+
+        if (commands_held_)
+        {
+            RCLCPP_INFO_THROTTLE(
+                rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+                *node_frames_interface_->get_clock(),
+                2000,
+                "[%s] manipulator commands currently held after reset",
+                robot_prefix.c_str());
+            for (auto &joint : hw_joint_struct_)
+            {
+                joint.command_state_.velocity = 0.0;
+                joint.command_state_.acceleration = 0.0;
+                joint.command_state_.current = 0.0;
+                joint.command_state_.effort = 0.0;
+                joint.command_state_.computed_effort = 0.0;
+                joint.current_state_.sim_time = time_seconds;
+                joint.current_state_.sim_period = delta_seconds;
+            }
+            control_power_ = 0.0;
+        }
+
+        arm_state.clear();
+        arm_state.reserve(10);
+
+        arm_torques.clear();
+        arm_torques.reserve(5);
+
+        for (int j = 0; j < 5; ++j)
+        {
+            hw_joint_struct_[j].current_state_.sim_time = time_seconds;
+            hw_joint_struct_[j].current_state_.sim_period = delta_seconds;
+        };
+        // First collect all positions
+        for (int j = 0; j < 5; ++j)
+        {
+            arm_state.push_back(hw_joint_struct_[j].current_state_.position);
+        };
+
+        // Then collect all velocities
+        for (int j = 0; j < 5; ++j)
+        {
+            arm_state.push_back(hw_joint_struct_[j].current_state_.velocity);
+        };
+
+        // Then collect all efforts, using your maps and current limiter
+        for (int j = 0; j < 5; ++j)
+        {
+            const double tau_cmd = hw_joint_struct_[j].command_state_.effort;
+
+            // torque -> current
+            double I_cmd = 0.0;
+            if (std::abs(tau_cmd) > kTorqueCurrentZeroEpsilon)
+            {
+                const bool pos_tau = (tau_cmd > 0.0);
+                std::vector<DM> T2C_arg = {
+                    DM(hw_joint_struct_[j].actuator_Properties_.kt),
+                    DM(pos_tau ? hw_joint_struct_[j].actuator_Properties_.forward_I_static
+                               : hw_joint_struct_[j].actuator_Properties_.backward_I_static),
+                    DM(tau_cmd)};
+                I_cmd = utils_service.torque2currentMap(T2C_arg).at(0).scalar();
+            }
+
+            // clamp in current using your existing hard limiter that also enforces position limits
+            const double I_safe = hw_joint_struct_[j].enforce_hard_limits(I_cmd);
+
+            // current -> torque
+            double tau_safe = 0.0;
+            if (std::abs(I_safe) > kTorqueCurrentZeroEpsilon)
+            {
+                const bool pos_cur = (I_safe > 0.0);
+                std::vector<DM> C2T_arg = {
+                    DM(hw_joint_struct_[j].actuator_Properties_.kt),
+                    DM(pos_cur ? hw_joint_struct_[j].actuator_Properties_.forward_I_static
+                               : hw_joint_struct_[j].actuator_Properties_.backward_I_static),
+                    DM(I_safe)};
+                tau_safe = utils_service.current2torqueMap(C2T_arg).at(0).scalar();
+            }
+
+            hw_joint_struct_[j].current_state_.current = I_safe;
+            hw_joint_struct_[j].current_state_.effort = tau_safe;
+            hw_joint_struct_[j].current_state_.computed_effort = tau_cmd;
+            hw_joint_struct_[j].current_state_.computed_effort_uncertainty = tau_cmd - tau_safe;
+            arm_torques.push_back(tau_safe);
+        };
+
+        control_power_ = 0.0;
+
+        for (int j = 0; j < 5; ++j)
+        {
+            const double tau = arm_torques[j].scalar();
+            const double qdot = hw_joint_struct_[j].current_state_.velocity;
+            control_power_ += std::abs(tau * qdot);
+        }
+
+        control_energy_ += control_power_ * delta_seconds;
+
+        // number of dynamic joints in the model
+        constexpr std::size_t n_dyn = 4;
+
+        // update hysteresis for the 4 dynamic joints
+        for (std::size_t j = 0; j < n_dyn; ++j)
+        {
+            // const double u = arm_torques[j];
+            const double u = arm_torques[j].scalar();
+
+            if (!is_locked_[j] && std::abs(u) < on_db_[j])
+            {
+                is_locked_[j] = true;
+            }
+            else if (is_locked_[j] && std::abs(u) > off_db_[j])
+            {
+                is_locked_[j] = false;
+            }
+        }
+
+        // build a single column mask of length 4
+        casadi::DM lock_mask = casadi::DM::zeros(static_cast<int>(n_dyn), 1);
+        for (std::size_t j = 0; j < n_dyn; ++j)
+        {
+            lock_mask(j) = is_locked_[j] ? 1.0 : 0.0;
+            // lock_mask(j) = 0.0;
+        }
+
+        // simulate_joint_lock_argument = {arm_torques, s_lock_current, on_db_, off_db_};
+        // joint_lock_sim = utils_service.manipulator_joint_lock_dynamics(simulate_joint_lock_argument);
+        
+        // casadi::DM lock_mask = casadi::DM::zeros(static_cast<int>(n_dyn), 1);
+        // for (std::size_t j = 0; j < n_dyn; ++j)
+        // {
+        //     lock_mask(j) = s_lock_current[j];
+        //     // lock_mask(j) = 0.0;
+        // }
+        // // optional log
+        // RCLCPP_INFO_THROTTLE(
+        //     rclcpp::get_logger("SimReachSystemMultiInterfaceHardware"),
+        //     *node_frames_interface_->get_clock(), 500,
+        //     "position = [%.3e %.3e %.3e %.3e | ee %.3e], mask = [%d %d %d %d]",
+        //     hw_joint_struct_[0].current_state_.position,
+        //     hw_joint_struct_[1].current_state_.position,
+        //     hw_joint_struct_[2].current_state_.position,
+        //     hw_joint_struct_[3].current_state_.position,
+        //     hw_joint_struct_[4].current_state_.position,
+        //     static_cast<int>(is_locked_[0]),
+        //     static_cast<int>(is_locked_[1]),
+        //     static_cast<int>(is_locked_[2]),
+        //     static_cast<int>(is_locked_[3]));
+
+        // call dynamics with the mask
+        arm_simulate_argument = {arm_state, arm_torques, delta_seconds, manipulator_parameters_, DM(endeffector_mass_),
+                                 DM(endeffector_damping_), DM(endeffector_stiffness_), lock_mask, DM(baumgarte_alpha_)};
+        arm_sim = utils_service.manipulator_dynamics(arm_simulate_argument);
+        arm_next_states = dense_vector(arm_sim.at(0), 10);
+
+        // clamp the NEW state, then write it back
+        for (int j = 0; j < 5; ++j)
+        {
+            double q = arm_next_states[j];
+            double qd = arm_next_states[5 + j];
+
+            const auto &lim = hw_joint_struct_[j].limits_;
+
+            if (q < lim.position_min)
+            {
+                q = lim.position_min;
+                if (qd < 0.0)
+                    qd = 0.0;
+            }
+            else if (q > lim.position_max)
+            {
+                q = lim.position_max;
+                if (qd > 0.0)
+                    qd = 0.0;
+            }
+
+            hw_joint_struct_[j].current_state_.position = q;
+            hw_joint_struct_[j].current_state_.velocity = qd;
+        }
+        // Publish TFs
+        rclcpp::Time current_time = node_frames_interface_->now();
+        if (realtime_frame_transform_publisher_ && realtime_frame_transform_publisher_->trylock())
+        {
+            auto &msg = realtime_frame_transform_publisher_->msg_;
+            auto &transforms = msg.transforms;
+
+            const std::string base = robot_prefix + "base_link";
+            const size_t nj = T_i_.size();
+            const size_t nc = T_com_i_.size();
+
+            transforms.clear();
+            transforms.resize(nj + nc);
+
+            // Joints
+            for (size_t i = 0; i < nj; ++i)
+            {
+                auto &t = transforms[i];
+                t.header.stamp = current_time;
+                t.header.frame_id = base;
+                t.child_frame_id = robot_prefix + "joint_" + std::to_string(i);
+
+                try
+                {
+                    const auto v_dense = dense_vector(T_i_[i], 7); // [x y z qw qx qy qz]
+                    t.transform.translation.x = v_dense[0];
+                    t.transform.translation.y = v_dense[1];
+                    t.transform.translation.z = v_dense[2];
+
+                    tf2::Quaternion q;
+                    q.setW(v_dense[3]);
+                    q.setX(v_dense[4]);
+                    q.setY(v_dense[5]);
+                    q.setZ(v_dense[6]);
+                    t.transform.rotation = tf2::toMsg(q);
+                }
+                catch (const std::exception &)
+                {
+                    // fallback, zero transform on bad shape
+                    t.transform.translation.x = 0.0;
+                    t.transform.translation.y = 0.0;
+                    t.transform.translation.z = 0.0;
+                    t.transform.rotation.w = 1.0;
+                    t.transform.rotation.x = 0.0;
+                    t.transform.rotation.y = 0.0;
+                    t.transform.rotation.z = 0.0;
+                }
+            }
+
+            // COMs
+            for (size_t i = 0; i < nc; ++i)
+            {
+                auto &t = transforms[nj + i];
+                t.header.stamp = current_time;
+                t.header.frame_id = base;
+                t.child_frame_id = robot_prefix + "link_com_" + std::to_string(i);
+
+                try
+                {
+                    const auto v_dense = dense_vector(T_com_i_[i], 7); // [x y z qw qx qy qz]
+                    t.transform.translation.x = v_dense[0];
+                    t.transform.translation.y = v_dense[1];
+                    t.transform.translation.z = v_dense[2];
+
+                    tf2::Quaternion q;
+                    q.setW(v_dense[3]);
+                    q.setX(v_dense[4]);
+                    q.setY(v_dense[5]);
+                    q.setZ(v_dense[6]);
+                    t.transform.rotation = tf2::toMsg(q);
+                }
+                catch (const std::exception &)
+                {
+                    t.transform.translation.x = 0.0;
+                    t.transform.translation.y = 0.0;
+                    t.transform.translation.z = 0.0;
+                    t.transform.rotation.w = 1.0;
+                    t.transform.rotation.x = 0.0;
+                    t.transform.rotation.y = 0.0;
+                    t.transform.rotation.z = 0.0;
+                }
+            }
+
+            realtime_frame_transform_publisher_->unlockAndPublish();
+        }
+
+        return hardware_interface::return_type::OK;
+    }
+
+} // namespace ros2_control_blue_reach_5
+
+#include "pluginlib/class_list_macros.hpp"
+
+PLUGINLIB_EXPORT_CLASS(
+    ros2_control_blue_reach_5::SimReachSystemMultiInterfaceHardware,
+    hardware_interface::SystemInterface)

@@ -1,0 +1,589 @@
+# Copyright (C) 2024 Edward Morgan
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+import random
+import yaml, copy
+
+class NoAliasDumper(yaml.SafeDumper):
+    def ignore_aliases(self, data):
+        return True
+    
+def rviz_file_configure(use_vehicle_hardware, use_manipulator_hardware, robot_prefixes,
+                         robot_base_links, ix, rviz_config_path,
+                         new_rviz_config_path, task, launch_camera=False,
+                         world_frame="world")->None:
+    # Load the RViz configuration file
+    with open(rviz_config_path,'r') as file:
+        rviz_config = yaml.load(file,yaml.SafeLoader)
+    new_rviz_config = copy.deepcopy(rviz_config)
+    visualization_manager = new_rviz_config.setdefault('Visualization Manager', {})
+    visualization_manager.setdefault('Global Options', {})['Fixed Frame'] = world_frame
+
+    rviz_view_configure(
+        robot_prefixes,
+        robot_base_links,
+        new_rviz_config,
+        task,
+    )
+    rviz_robot_metrics_overlay_configure(robot_prefixes, new_rviz_config)
+    rviz_states_axes_configure(robot_prefixes, new_rviz_config)
+    rviz_robots_path_configure(robot_prefixes, new_rviz_config)
+
+    rviz_add_mocap_pose_and_path(
+        new_rviz_config,
+        pose_topic="/mocap_pose",
+        path_topic="/mocap_path",
+        name_prefix="mocap_rb",
+        color="25; 255; 0",
+        enabled=False
+    )
+
+    rviz_add_mocap_pose_and_path(
+        new_rviz_config,
+        pose_topic="/map_mocap_pose",
+        path_topic="/map_mocap_path",
+        name_prefix="map_mocap_rb",
+        color="255; 0; 0",
+        enabled=True
+    )
+
+
+
+    if launch_camera:
+        image_stream_display("video feed", "/alpha/image_raw", new_rviz_config, True)
+
+    if use_vehicle_hardware:
+        # IMU visualization
+        imu_display(
+            name="Imu",
+            topic="/mavros/imu/data",
+            rviz_config=new_rviz_config,
+            enabled=True
+        )
+
+
+    if task == 'interactive':
+        rviz_interactive_marker('controller_interactiveMarker', '/uvms_interactive_controls', new_rviz_config, True)
+        rviz_point_cloud2('uvms_taskspace',"/workspace_pointcloud",new_rviz_config, True, "255; 255; 255",
+                          custom_properties={"Decay Time": 0.0, "Size (Pixels)": 1.5})
+        rviz_point_cloud2('uv_vehicle_base',"/base_pointcloud",new_rviz_config, True, "255; 0; 0",
+                          custom_properties={"Decay Time": 0.0, "Size (Pixels)": 1.5})
+
+    rviz_point_cloud2(
+        name='environment_voxels',
+        topic='/env_voxels_cloud',
+        rviz_config=new_rviz_config,
+        enabled=True, 
+        color='255; 255; 255',
+        custom_properties={
+            "Alpha": 1,
+            "Autocompute Intensity Bounds": True,
+            "Autocompute Value Bounds": {"Max Value": 10, "Min Value": -10, "Value": True},
+            "Axis": "Z",
+            "Channel Name": "intensity",
+            "Class": "rviz_default_plugins/PointCloud2",
+            "Color Transformer": "AxisColor",
+            "Decay Time": 0,
+            "Invert Rainbow": False,
+            "Max Color": "255; 255; 255",
+            "Max Intensity": 4096,
+            "Min Color": "0; 0; 0",
+            "Min Intensity": 0,
+            "Position Transformer": "XYZ",
+            "Selectable": True,
+            "Size (Pixels)": 3,
+            "Size (m)": 0.01,
+            "Style": "Flat Squares",
+            # Match the reliable publisher for this multi-megabyte static cloud.
+            "Topic": {
+                "Depth": 1,
+                "Durability Policy": "Transient Local",
+                "History Policy": "Keep Last",
+                "Reliability Policy": "Reliable",
+                "Value": "/env_voxels_cloud",
+            },
+            "Use Fixed Frame": True,
+            "Use rainbow": True,
+            "Value": True,
+        }
+    )
+    
+    rviz_point_cloud2(
+        'dynamic_collision_voxels', '/dynamic_voxels_cloud', new_rviz_config,
+        True, '255; 140; 30', custom_properties={
+            'Decay Time': 0.0, 'Style': 'Flat Squares', 'Size (m)': 0.01,
+            'Topic': {'Depth': 1, 'Durability Policy': 'Transient Local',
+                      'History Policy': 'Keep Last', 'Reliability Policy': 'Reliable',
+                      'Value': '/dynamic_voxels_cloud'},
+        })
+
+    # visualize /contact_markers from collision node
+    rviz_contact_markers_display(
+        new_rviz_config,
+        topic="/contact_markers",
+        name="Collision Contacts",
+        enabled=True
+    )
+    
+    # waypoint visualisation from planner
+    rviz_contact_markers_display(
+        new_rviz_config,
+        topic="/planned_waypoints_marker",
+        name="planned waypoints",
+        enabled=True,
+        depth=100,
+    )
+    rviz_marker_array_display(
+        new_rviz_config,
+        topic="/dynamic_obstacle_markers",
+        name="Dynamic Obstacles",
+        enabled=True
+    )
+    add_wrench_entries(ix, new_rviz_config, True)
+    with open(new_rviz_config_path,'w') as file:
+        yaml.dump(new_rviz_config,file,Dumper=NoAliasDumper)
+
+
+def rviz_robot_metrics_overlay_configure(robot_prefixes, rviz_config):
+    displays = rviz_config.get('Visualization Manager', {}).get('Displays', [])
+    overlay_height = max(356, 238 + 118 * max(len(robot_prefixes), 1))
+
+    for display in displays:
+        if display.get('Name') != 'RobotMetricsOverlay':
+            continue
+
+        display['Background Alpha'] = 0.44999998807907104
+        display['Background Color'] = '0; 0; 0'
+        display['Class'] = 'rviz_2d_overlay_plugins/TextOverlay'
+        display['Enabled'] = True
+        display['Foreground Alpha'] = 0.949999988079071
+        display['Foreground Color'] = '255; 230; 51'
+        display['Invert Shadow'] = False
+        display['Overtake BG Color Properties'] = True
+        display['Overtake FG Color Properties'] = False
+        display['Overtake Position Properties'] = True
+        display['Topic'] = {
+            'Depth': 5,
+            'Durability Policy': 'Volatile',
+            'History Policy': 'Keep Last',
+            'Reliability Policy': 'Reliable',
+            'Value': '/robot_metrics_overlay_text',
+        }
+        display['Value'] = True
+        display['font'] = 'Sans Serif'
+        display['height'] = overlay_height
+        display['hor_alignment'] = 'right'
+        display['hor_dist'] = 28
+        display['line width'] = 216
+        display['text size'] = 14
+        display['ver_alignment'] = 'top'
+        display['ver_dist'] = 170
+        display['width'] = 1200
+        break
+
+
+def rviz_path_display(name, topic, rviz_config, color, enabled):
+    path_config = {
+        "Alpha": 1,
+        "Buffer Length": 1,
+        "Class": "rviz_default_plugins/Path",
+        "Color": color,
+        "Enabled": enabled,
+        "Head Diameter": 0.3,
+        "Head Length": 0.2,
+        "Length": 0.3,
+        "Line Style": "Billboards",
+        "Line Width": 0.03,
+        "Name": name,
+        "Offset": {
+            "X": 0,
+            "Y": 0,
+            "Z": 0
+        },
+        "Pose Color": "255; 85; 255",
+        "Pose Style": "None",
+        "Radius": 0.03,
+        "Shaft Diameter": 0.1,
+        "Shaft Length": 0.1,
+        "Topic": {
+            "Depth": 5,
+            "Durability Policy": "Volatile",
+            "Filter size": 40,
+            "History Policy": "Keep Last",
+            "Reliability Policy": "Reliable",
+            "Value": topic
+        },
+        "Value": True
+    }
+    rviz_config['Visualization Manager']['Displays'].append(path_config)
+
+def rviz_pose_display(name, topic, rviz_config, enabled=True, axes_len=1.0, axes_radius=0.1):
+    pose_cfg = {
+        "Class": "rviz_default_plugins/Pose",
+        "Enabled": enabled,
+        "Name": name,
+        "Shape": "Axes",
+        "Axes Length": axes_len,
+        "Axes Radius": axes_radius,
+        "Topic": {
+            "Depth": 10,
+            "Durability Policy": "Volatile",
+            "History Policy": "Keep Last",
+            "Reliability Policy": "Reliable",
+            "Value": topic
+        },
+        "Value": True
+    }
+    rviz_config["Visualization Manager"]["Displays"].append(pose_cfg)
+
+
+def rviz_axes_display(name, reference_frame, rviz_config, length, radius, enabled):
+    added_axes = {'Class': 'rviz_default_plugins/Axes',
+        'Enabled': enabled,
+        'Length': str(length),
+        'Name': name,
+        'Radius': str(radius),
+        'Reference Frame': reference_frame,
+        'Value': True}
+    rviz_config['Visualization Manager']['Displays'].append(added_axes)
+    
+def rviz_point_cloud2(name, topic, rviz_config, enabled, color="255; 255; 255", custom_properties=None):
+    added_point_cloud2 = {
+        "Alpha": 1,
+        "Autocompute Intensity Bounds": True,
+        "Autocompute Value Bounds": {
+            "Max Value": 10,
+            "Min Value": -10,
+            "Value": True
+        },
+        "Axis": "Z",
+        "Channel Name": "intensity",
+        "Class": "rviz_default_plugins/PointCloud2",
+        "Color": color,
+        "Color Transformer": "FlatColor",
+        "Decay Time": 0.30000001192092896,
+        "Enabled": enabled,
+        "Invert Rainbow": False,
+        "Max Color": "255; 255; 255",
+        "Max Intensity": 4096,
+        "Min Color": "0; 0; 0",
+        "Min Intensity": 0,
+        "Name": name,
+        "Position Transformer": "XYZ",
+        "Selectable": False,
+        "Size (Pixels)": 1.5,
+        "Size (m)": 0.009999999776482582,
+        "Style": "Points",
+        "Topic": {
+            "Depth": 5,
+            "Durability Policy": "Volatile",
+            "Filter size": 100,
+            "History Policy": "Keep Last",
+            "Reliability Policy": "Best Effort",
+            "Value": topic
+        },
+        "Use Fixed Frame": True,
+        "Use rainbow": True,
+        "Value": True
+    }
+    # Override default properties with any custom properties provided
+    if custom_properties:
+        added_point_cloud2.update(custom_properties)
+    
+    rviz_config['Visualization Manager']['Displays'].append(added_point_cloud2)
+
+
+def rviz_interactive_marker(name, namespace, rviz_config, enabled):
+    added_interactive_marker = {'Class': 'rviz_default_plugins/InteractiveMarkers',
+        'Enable Transparency': True,
+        'Enabled': enabled,
+        'Interactive Markers Namespace': namespace,
+        'Name': name,
+        'Show Axes': True,
+        'Show Descriptions': False,
+        'Show Visual Aids': False,
+        'Value': True}
+    rviz_config['Visualization Manager']['Displays'].append(added_interactive_marker)
+
+def image_stream_display(name, topic,rviz_config, enabled):
+    image_config = {
+        "Class": "rviz_default_plugins/Image",
+        "Enabled": enabled,
+        "Max Value": 1,
+        "Median window": 5,
+        "Min Value": 0,
+        "Name": name,
+        "Normalize Range": True,
+        "Topic": {
+            "Depth": 5,
+            "Durability Policy": "Volatile",
+            "History Policy": "Keep Last",
+            "Reliability Policy": "Reliable",
+            "Value": topic
+        },
+        "Value": True
+    }
+    rviz_config['Visualization Manager']['Displays'].append(image_config)
+
+def camera_overlay_display(
+    name,
+    topic,
+    rviz_config,
+    enabled,
+    image_rendering="overlay",
+    overlay_alpha=1.0,
+):
+    camera_config = {
+        "Class": "rviz_default_plugins/Camera",
+        "Enabled": enabled,
+        "Far Plane Distance": 100,
+        "Image Rendering": image_rendering,
+        "Name": name,
+        "Overlay Alpha": overlay_alpha,
+        "Topic": {
+            "Depth": 5,
+            "Durability Policy": "Transient Local",
+            "History Policy": "Keep Last",
+            "Reliability Policy": "Reliable",
+            "Value": topic
+        },
+        "Value": enabled,
+        "Visibility": {
+            "Value": True
+        },
+        "Zoom Factor": 1.0,
+    }
+    rviz_config['Visualization Manager']['Displays'].append(camera_config)
+
+def imu_display(name, topic,rviz_config, enabled):
+    imu_config = {
+            "Acceleration properties": {
+                "Acc. vector alpha": 0.10000000149011612,
+                "Acc. vector color": "255; 0; 0",
+                "Acc. vector scale": 0.05000000074505806,
+                "Derotate acceleration": True,
+                "Enable acceleration": False
+            },
+            "Axes properties": {
+                "Axes scale": 0.2,
+                "Enable axes": True
+            },
+            "Box properties": {
+                "Box alpha": 1,
+                "Box color": "255; 0; 0",
+                "Enable box": False,
+                "x_scale": 1,
+                "y_scale": 1,
+                "z_scale": 1
+            },
+            "Class": "rviz_imu_plugin/Imu",
+            "Enabled": enabled,
+            "Name": name,
+            "Topic": {
+                "Depth": 13,
+                "Durability Policy": "Volatile",
+                "Filter size": 10,
+                "History Policy": "Keep Last",
+                "Reliability Policy": "Best Effort",
+                "Value": topic
+            },
+            "Value": True,
+            "fixed_frame_orientation": True
+        }
+    rviz_config['Visualization Manager']['Displays'].append(imu_config)
+
+def rviz_contact_markers_display(rviz_config,
+                                 topic,
+                                 name,
+                                 enabled=True,
+                                 depth=5):
+    marker_cfg = {
+        "Class": "rviz_default_plugins/Marker",
+        "Enabled": enabled,
+        "Name": name,
+        "Namespaces": {},
+        "Queue Size": 100,
+        "Topic": {
+            "Depth": depth,
+            "Durability Policy": "Volatile",
+            "History Policy": "Keep Last",
+            "Reliability Policy": "Reliable",
+            "Value": topic
+        },
+        "Value": True
+    }
+    rviz_config["Visualization Manager"]["Displays"].append(marker_cfg)
+
+
+def rviz_marker_array_display(rviz_config,
+                              topic,
+                              name,
+                              enabled=True):
+    marker_array_cfg = {
+        "Class": "rviz_default_plugins/MarkerArray",
+        "Enabled": enabled,
+        "Name": name,
+        "Namespaces": {},
+        "Queue Size": 100,
+        "Topic": {
+            "Depth": 5,
+            "Durability Policy": "Transient Local",
+            "History Policy": "Keep Last",
+            "Reliability Policy": "Reliable",
+            "Value": topic
+        },
+        "Value": True
+    }
+    rviz_config["Visualization Manager"]["Displays"].append(marker_array_cfg)
+
+
+def generate_random_color(path_type=None, default=False):
+    """
+    Generates a random color in the "R; G; B" string format.
+    
+    Returns:
+    - str: Random color as "R; G; B".
+    """
+    if default and path_type=='ref_path':
+        default_path_color = "248; 228; 92"       # Yellow for the first robot's Path
+        return default_path_color
+    if default and path_type=='robot_path': 
+        default_traj_color = "224;27;36"        # Red for the first robot's TrajectoryPath
+        return default_traj_color
+        
+    r = random.randint(0, 255)
+    g = random.randint(0, 255)
+    b = random.randint(0, 255)
+    return f"{r}; {g}; {b}"
+
+def rviz_robots_path_configure(robot_prefixes, rviz_config):
+    enabled = True
+    for idx, prefix in enumerate(robot_prefixes):
+        if idx == 0:
+            traj_color = generate_random_color('robot_path', True)
+        else:
+            traj_color = generate_random_color()
+        rviz_path_display(f"{prefix}/robotPath", f"/{prefix}robotPath", rviz_config, traj_color, enabled)
+
+def rviz_states_axes_configure(robot_prefixes, rviz_config):
+    for prefix in robot_prefixes:
+        base_link = f'{prefix}base_link'
+        robot_map_frame = f'{prefix}map'
+        rviz_axes_display(base_link, base_link, rviz_config, 0.1, 0.01, True)
+        rviz_axes_display(robot_map_frame, f'{prefix}map', rviz_config, 0.1, 0.01, True)
+        rviz_axes_display(f'{prefix}dvl_frame', f"{prefix}dvl_link", rviz_config, 0.1, 0.01, True)
+        rviz_axes_display(f'{prefix}mocap_frame', f"{prefix}mocap_link", rviz_config, 0.1, 0.01, False)
+        for i in range(5):
+            rviz_axes_display(f'{prefix}joint_{i}', f"{prefix}joint_{i}", rviz_config, 0.1, 0.01, True)
+        
+def rviz_view_configure(robot_prefixes, robot_base_links, rviz_config, task, add_camera_views=False):
+    rviz_config['Visualization Manager']['Views']['Saved'] = []
+    original_view = {
+        'Class': 'rviz_default_plugins/Orbit',
+        'Distance': 8.755668640136719,
+        'Enable Stereo Rendering': {
+          'Stereo Eye Separation': 0.05999999865889549,
+          'Stereo Focal Distance': 1,
+          'Swap Stereo Eyes': False,
+          'Value': False},
+        'Focal Point': {
+          'X': 0,
+          'Y': 0,
+          'Z': 0},
+        'Focal Shape Fixed Size': True,
+        'Focal Shape Size': 0.05000000074505806,
+        'Invert Z Axis': False,
+        'Name': 'World Origin',
+        'Near Clip Distance': 0.009999999776482582,
+        'Pitch': 0.44020360708236694,
+        'Target Frame': 'base_link',
+        'Value': 'Orbit (rviz)',
+        'Yaw': 3.3494811058044434
+    }
+    rviz_config['Visualization Manager']['Views']['Saved'].append(original_view)
+    for i, prefix in enumerate(robot_prefixes):
+        new_view = original_view.copy()
+        new_view['Name'] = f'{prefix} view'
+        new_view['Target Frame'] = robot_base_links[i]
+        rviz_config['Visualization Manager']['Views']['Saved'].append(new_view)
+        if add_camera_views:
+            camera_view = {
+                'Class': 'rviz_default_plugins/FPS',
+                'Enable Stereo Rendering': {
+                  'Stereo Eye Separation': 0.05999999865889549,
+                  'Stereo Focal Distance': 1,
+                  'Swap Stereo Eyes': False,
+                  'Value': False},
+                'Invert Z Axis': False,
+                'Name': f'{prefix} camera view',
+                'Near Clip Distance': 0.009999999776482582,
+                'Pitch': 0,
+                'Position': {
+                  'X': 0,
+                  'Y': 0,
+                  'Z': 0},
+                'Target Frame': f'{prefix}camera_link',
+                'Value': 'FPS (rviz_default_plugins)',
+                'Yaw': 0
+            }
+            rviz_config['Visualization Manager']['Views']['Saved'].append(camera_view)
+    if task == 'interactive':
+        new_view = original_view.copy()
+        new_view['Name'] = f'marker view'
+        new_view['Target Frame'] = 'vehicle_marker_frame'
+        rviz_config['Visualization Manager']['Views']['Saved'].append(new_view)
+
+
+def add_wrench_entries(ix, rviz_config, enabled= True):
+    # The existing wrench configuration you want to replicate
+    original_wrench = {
+        'Accept NaN Values': False,
+        'Alpha': 1,
+        'Arrow Width': 0.3,
+        'Class': 'rviz_default_plugins/Wrench',
+        'Enabled': enabled,
+        'Force Arrow Scale': 0.1,
+        'Force Color': '204; 51; 51',
+        'History Length': 1,
+        'Name': 'Wrench',
+        'Torque Arrow Scale': 0.2,
+        'Torque Color': '204; 204; 51',
+        'Value': True
+    }
+
+    # Add new Wrench entries with the incremented index in the 'Value' field
+    for i in ix:
+        new_wrench = original_wrench.copy()
+        new_wrench['Name'] = f'robot_Wrench_{i}'
+        new_wrench['Topic'] = {
+            'Depth': 5,
+            'Durability Policy': 'Volatile',
+            'Filter size': 10,
+            'History Policy': 'Keep Last',
+            'Reliability Policy': 'Reliable',
+            'Value': f'/fts_broadcaster_{i}/wrench'
+        }
+        rviz_config['Visualization Manager']['Displays'].append(new_wrench)
+
+def rviz_add_mocap_pose_and_path(rviz_config,
+                                 pose_topic="/mocap_pose",
+                                 path_topic="/mocap_path",
+                                 name_prefix="mocap",
+                                 color="25; 255; 0",
+                                 enabled=True):
+    rviz_pose_display(f"{name_prefix}/Pose", pose_topic, rviz_config, enabled, 0.15, 0.015)
+    rviz_path_display(f"{name_prefix}/Path", path_topic, rviz_config, color, enabled)
+    rviz_config["Visualization Manager"]["Displays"][-1]["Line Style"] = "Billboards"
+    rviz_config["Visualization Manager"]["Displays"][-1]["Buffer Length"] = 100

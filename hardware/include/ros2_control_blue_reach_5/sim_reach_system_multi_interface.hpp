@@ -1,0 +1,198 @@
+// Copyright (C) 2024 Edward Morgan
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#ifndef ROS2_CONTROL_BLUE_REACH_5__SIM_REACH_SYSTEM_MULTI_INTERFACE_HPP_
+#define ROS2_CONTROL_BLUE_REACH_5__SIM_REACH_SYSTEM_MULTI_INTERFACE_HPP_
+
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "hardware_interface/handle.hpp"
+#include "hardware_interface/hardware_info.hpp"
+#include "hardware_interface/system_interface.hpp"
+#include "hardware_interface/types/hardware_interface_return_values.hpp"
+#include "rclcpp/clock.hpp"
+#include "rclcpp/duration.hpp"
+#include "rclcpp/macros.hpp"
+#include "rclcpp/time.hpp"
+#include "rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp"
+#include "rclcpp_lifecycle/state.hpp"
+#include "std_srvs/srv/trigger.hpp"
+#include "ros2_control_blue_reach_5/srv/reset_sim_uvms.hpp"
+#include "ros2_control_blue_reach_5/srv/set_sim_dynamics.hpp"
+#include "ros2_control_blue_reach_5/visibility_control.h"
+
+#include "ros2_control_blue_reach_5/driver.hpp"
+#include "ros2_control_blue_reach_5/packet.hpp"
+#include "ros2_control_blue_reach_5/state.hpp"
+#include "ros2_control_blue_reach_5/custom_hardware_interface_type_values.hpp"
+#include "ros2_control_blue_reach_5/utils.hpp"
+
+#include <casadi/casadi.hpp>
+
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
+#include <realtime_tools/realtime_publisher.hpp>
+
+namespace ros2_control_blue_reach_5
+{
+    using tf = tf2_msgs::msg::TFMessage;
+    class SimReachSystemMultiInterfaceHardware : public hardware_interface::SystemInterface
+    {
+
+    public:
+        RCLCPP_SHARED_PTR_DEFINITIONS(SimReachSystemMultiInterfaceHardware);
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        ~SimReachSystemMultiInterfaceHardware() override;
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        hardware_interface::CallbackReturn on_init(
+            const hardware_interface::HardwareComponentInterfaceParams &params) override;
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        hardware_interface::CallbackReturn on_configure(
+            const rclcpp_lifecycle::State &previous_state) override;
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        hardware_interface::CallbackReturn on_cleanup(
+            const rclcpp_lifecycle::State &previous_state) override;
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        hardware_interface::return_type prepare_command_mode_switch(
+            const std::vector<std::string> &start_interfaces,
+            const std::vector<std::string> &stop_interfaces) override;
+
+        // ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        // hardware_interface::return_type perform_command_mode_switch(
+        //     const std::vector<std::string> &start_interfaces,
+        //     const std::vector<std::string> &stop_interfaces) override;
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        hardware_interface::CallbackReturn on_activate(
+            const rclcpp_lifecycle::State &previous_state) override;
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        hardware_interface::CallbackReturn on_deactivate(
+            const rclcpp_lifecycle::State &previous_state) override;
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        hardware_interface::return_type read(
+            const rclcpp::Time &time, const rclcpp::Duration &period) override;
+
+        ROS2_CONTROL_BLUE_REACH_5_PUBLIC
+        hardware_interface::return_type write(
+            const rclcpp::Time &time, const rclcpp::Duration &period) override;
+
+    private:
+        void reset_joint_simulation_state();
+        void reset_joint_simulation_state(
+            const ros2_control_blue_reach_5::srv::ResetSimUvms::Request &request);
+        void reset_joint_estimators();
+        void seed_joint_estimator_from_state(std::size_t index, const Joint::State &state);
+        void apply_pending_reset_request();
+        void stop_ros_interfaces() noexcept;
+
+        double payload_mass = 0;
+        double payload_Ixx = 0;
+        double payload_Iyy = 0;
+        double payload_Izz = 0;
+        double gravity_ = 0;
+        std::vector<casadi::DM> manipulator_parameters_;
+        double joint_lock_on_deadband_{0.05};
+        double joint_lock_off_deadband_{0.10};
+        double baumgarte_alpha_{200.0};
+        double endeffector_mass_{300.0};
+        double endeffector_damping_{400.0};
+        double endeffector_stiffness_{0.0};
+
+        std::string system_name;
+
+        // Store the state & commands for the robot joints
+        std::vector<Joint> hw_joint_struct_;
+
+        std::string robot_prefix;
+        
+         // One EKF per joint
+        std::vector<casadi::DM> x_est_list_;             // each is 3x1
+        std::vector<casadi::DM> P_est_list_;             // each is 3x3
+        std::vector<casadi::DM> Q_list_;                 // each is 3x3
+        std::vector<casadi::DM> R_list_;                 // each is 2x2
+        std::vector<std::array<double, 3>> P_diag_list_; // cached diagonals for quick inspection
+
+        std::shared_ptr<rclcpp::Node> node_frames_interface_;
+        std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
+        std::thread spin_thread_;
+        std::mutex simulation_state_mutex_;
+        std::mutex reset_request_mutex_;
+        std::condition_variable reset_applied_cv_;
+        std::optional<ros2_control_blue_reach_5::srv::ResetSimUvms::Request> pending_reset_request_;
+        std::uint64_t reset_request_sequence_{0};
+        std::uint64_t reset_applied_sequence_{0};
+        std::uint64_t reset_failed_sequence_{0};
+        std::string reset_failure_message_;
+
+        rclcpp::Publisher<tf>::SharedPtr frame_transform_publisher_;
+        std::shared_ptr<realtime_tools::RealtimePublisher<tf>> realtime_frame_transform_publisher_;
+        rclcpp::Service<ros2_control_blue_reach_5::srv::ResetSimUvms>::SharedPtr reset_service_;
+        rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr release_service_;
+        rclcpp::Service<ros2_control_blue_reach_5::srv::SetSimDynamics>::SharedPtr dynamics_service_;
+
+        double delta_seconds{0.0};
+        double time_seconds{0.0};
+        bool commands_held_{false};
+        bool use_coupled_dynamics_{false};
+
+        std::vector<bool>   is_locked_;
+        std::vector<double> on_db_;
+        std::vector<double> off_db_;
+        std::vector<double>  s_lock_current;
+
+        std::vector<casadi::DM> arm_state;
+        std::vector<casadi::DM> arm_torques;
+
+        std::vector<DM> arm_simulate_argument;
+        std::vector<DM> simulate_joint_lock_argument;
+        std::vector<DM> joint_lock_sim;
+        std::vector<DM> arm_sim;
+        std::vector<double> arm_next_states;
+        
+
+        // cache FK outputs computed in read
+        std::vector<casadi::DM> T_i_;
+        std::vector<casadi::DM> T_com_i_;
+
+        // Store the utils function for the robot joints
+        casadi_reach_alpha_5::Utils utils_service;
+
+        double control_power_{0.0};
+        double control_energy_{0.0};
+    };
+
+} // namespace ros2_control_blue_reach_5
+#endif // ROS2_CONTROL_BLUE_REACH_5__SIM_REACH_SYSTEM_MULTI_INTERFACE_HPP_

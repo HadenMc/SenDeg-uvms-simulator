@@ -1,0 +1,228 @@
+Installation and Build
+======================
+
+Build the project as a ROS 2 workspace. A complete workspace normally contains:
+
+- ``uvms-simulator``: exported ROS package
+  ``ros2_control_blue_reach_5``.
+- ``uvms-simlab``: exported ROS package ``simlab`` with SimLab action,
+  message, and service interfaces.
+- Dependency repositories from ``uvms-simulator/dependency_repos.repos``.
+
+System Requirements
+-------------------
+
+- Ubuntu with ROS 2 Jazzy.
+- ``colcon``, ``rosdep``, and ``vcs``.
+- CasADi built from source and available at runtime.
+- Git LFS for large model/resource files.
+
+Install core apt dependencies:
+
+.. code-block:: shell
+
+   sudo apt update
+   sudo apt install git-lfs \
+       ros-$ROS_DISTRO-hardware-interface \
+       ros-$ROS_DISTRO-xacro \
+       ros-$ROS_DISTRO-gpio-controllers \
+       ros-$ROS_DISTRO-controller-manager \
+       ros-$ROS_DISTRO-joint-state-broadcaster \
+       ros-$ROS_DISTRO-joint-state-publisher-gui \
+       ros-$ROS_DISTRO-forward-command-controller \
+       ros-$ROS_DISTRO-force-torque-sensor-broadcaster \
+       ros-$ROS_DISTRO-ros2-control \
+       ros-$ROS_DISTRO-mavros \
+       ros-$ROS_DISTRO-mavros-msgs \
+       ros-$ROS_DISTRO-nav2-msgs \
+       ros-$ROS_DISTRO-rviz-imu-plugin \
+       ros-$ROS_DISTRO-rviz-2d-overlay-plugins \
+       ros-$ROS_DISTRO-rviz-2d-overlay-msgs \
+       ros-$ROS_DISTRO-rosbag2 \
+       ros-$ROS_DISTRO-interactive-markers \
+       ros-$ROS_DISTRO-cv-bridge \
+       gstreamer1.0-plugins-base \
+       libgstreamer1.0-dev \
+       libgstreamer-plugins-base1.0-dev
+
+Install PlotJuggler from Snap for the newer MCAP and scripting support used by
+the launch workflow:
+
+.. code-block:: shell
+
+   sudo snap install plotjuggler
+
+The main launch file starts ``/snap/bin/plotjuggler`` when
+``launch_plotjuggler:=true``. If the ROS package
+``ros-$ROS_DISTRO-plotjuggler-ros`` is also installed, it can remain installed;
+the launch file does not use that older executable.
+
+If CasADi is outside the system linker path:
+
+.. code-block:: shell
+
+   export LD_LIBRARY_PATH=/path/to/casadi/build/lib:$LD_LIBRARY_PATH
+
+Workspace Setup
+---------------
+
+.. code-block:: shell
+
+   mkdir -p ~/ros_ws/src
+   cd ~/ros_ws/src
+
+   git clone https://github.com/edxmorgan/uvms-simulator.git
+   git clone https://github.com/edxmorgan/uvms-simlab.git
+
+   vcs import < uvms-simulator/dependency_repos.repos
+
+   cd ~/ros_ws
+   rosdep install --from-paths src --ignore-src -r -y
+
+Python Dependencies
+-------------------
+
+Install Python packages used by SimLab for joystick control, planning, FCL,
+Ruckig, and simulated camera rendering:
+
+.. code-block:: shell
+
+   python3 -m pip install pyPS4Controller pynput scipy casadi ruckig \
+       python-fcl trimesh pycollada pyvista open3d
+
+Install the optional RSL-RL training dependency when you want to train through
+the ``uvms_rl`` RSL-RL adapter:
+
+.. code-block:: shell
+
+   python3 -m pip install rsl-rl-lib
+
+OMPL Python Bindings
+--------------------
+
+The planner server uses OMPL through Python bindings. One working installation
+route is the Kavraki Lab installer:
+
+.. code-block:: shell
+
+   wget https://ompl.kavrakilab.org/install-ompl-ubuntu.sh
+   chmod u+x install-ompl-ubuntu.sh
+   ./install-ompl-ubuntu.sh --python
+
+Build
+-----
+
+Build and source the whole workspace:
+
+.. code-block:: shell
+
+   cd ~/ros_ws
+   colcon build
+   source install/setup.bash
+
+For focused development:
+
+.. code-block:: shell
+
+   colcon build --packages-select ros2_control_blue_reach_5 simlab
+   source install/setup.bash
+
+Optional GPU Dynamics Build
+---------------------------
+
+``ros2_control_blue_reach_5`` can build the batched UVMS GPU dynamics backend
+when a CUDA toolkit is available. The default mode is ``AUTO``: CPU dynamics are
+always built, and CUDA dynamics are added when ``nvcc`` and a reliable CUDA
+architecture setting are available.
+
+On modern CMake versions the package uses ``CMAKE_CUDA_ARCHITECTURES=native``.
+If you need to set the architecture manually, use a real/native target rather
+than PTX-only output. For example, RTX 5090 is compute capability ``12.0``, so
+use ``120``:
+
+.. code-block:: shell
+
+   CUDACXX=/usr/local/cuda/bin/nvcc colcon build \
+       --packages-select ros2_control_blue_reach_5 simlab \
+       --cmake-args \
+       -DUVMS_ENABLE_CUDA_DYNAMICS=ON \
+       -DUVMS_CUDA_ARCHITECTURES=120
+
+Avoid PTX-only settings such as ``90-virtual`` for the UVMS RL backend; they can
+build successfully and still fail at runtime on newer GPUs if the driver/toolkit
+pair cannot load that PTX. If you change CUDA toolkit or architecture settings,
+delete the package build cache before rebuilding:
+
+.. code-block:: shell
+
+   rm -rf build/ros2_control_blue_reach_5 install/ros2_control_blue_reach_5
+
+To force a CPU-only build:
+
+.. code-block:: shell
+
+   colcon build --packages-select ros2_control_blue_reach_5 simlab \
+       --cmake-args -DUVMS_ENABLE_CUDA_DYNAMICS=OFF
+
+Documentation Build
+-------------------
+
+Install Python docs dependencies:
+
+.. code-block:: shell
+
+   python3 -m pip install -r src/uvms-simulator/doc/requirements-docs.txt
+
+Build the Sphinx site:
+
+.. code-block:: shell
+
+   cd ~/ros_ws/src/uvms-simulator/doc
+   make html
+
+Open:
+
+.. code-block:: text
+
+   doc/_build/html/index.html
+
+The HTML docs are built by default during local ``colcon`` builds. To disable
+that for a faster code-only build:
+
+.. code-block:: shell
+
+   colcon build --packages-select ros2_control_blue_reach_5 \
+       --cmake-args -DUVMS_BUILD_DOCS=OFF
+
+When docs are enabled, the generated HTML is written to
+``src/uvms-simulator/doc/_build/html``.
+
+GitHub Pages Deployment
+-----------------------
+
+The repository includes a GitHub Actions workflow for publishing the Sphinx
+site to GitHub Pages:
+
+.. code-block:: text
+
+   .github/workflows/docs-pages.yml
+
+On pushes to ``main``, the workflow builds ``doc/_build/html``
+and deploys it as the Pages artifact. Pull requests build the docs but do not
+deploy them.
+
+First Launch Check
+------------------
+
+After the build succeeds, launch one simulated interactive UVMS:
+
+.. code-block:: shell
+
+   ros2 launch ros2_control_blue_reach_5 robot_system_multi_interface.launch.py \
+       use_manipulator_hardware:=false \
+       use_vehicle_hardware:=false \
+       sim_robot_count:=1 \
+       task:=interactive
+
+For hardware launch flows, see :doc:`hil_setup`.
+For first-use runtime steps, see :doc:`userdoc`.
